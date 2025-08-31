@@ -13,8 +13,15 @@ import (
 )
 
 func tcpCopyData(dst net.Conn, src net.Conn, ch chan<- error) {
-	_, err := io.Copy(dst, src)
-	ch <- err
+	buf := GetBuffer()
+	defer PutBuffer(buf)
+
+	_, err := io.CopyBuffer(dst, src, buf)
+	if err != nil && err != io.EOF {
+		ch <- err
+	} else {
+		ch <- nil
+	}
 }
 
 func tcpHandleConnection(conn net.Conn, logger *slog.Logger) {
@@ -44,6 +51,7 @@ func tcpHandleConnection(conn net.Conn, logger *slog.Logger) {
 		return
 	}
 
+	//parse PROXY header
 	saddr, _, restBytes, err := PROXYReadRemoteAddr(buffer[:n], TCP)
 	if err != nil {
 		logger.Debug("failed to parse PROXY header", "error", err, slog.Bool("dropConnection", true))
@@ -83,6 +91,7 @@ func tcpHandleConnection(conn net.Conn, logger *slog.Logger) {
 		logger.Debug("successfully established upstream connection")
 	}
 
+	//Disable Nagle's Algorithm
 	if err := conn.(*net.TCPConn).SetNoDelay(true); err != nil {
 		logger.Debug("failed to set nodelay on downstream connection", "error", err, slog.Bool("dropConnection", true))
 	} else if Opts.Verbose > 1 {
@@ -109,8 +118,15 @@ func tcpHandleConnection(conn net.Conn, logger *slog.Logger) {
 	buffer = nil
 
 	outErr := make(chan error, 2)
-	go tcpCopyData(upstreamConn, conn, outErr)
-	go tcpCopyData(conn, upstreamConn, outErr)
+	go func() {
+		tcpCopyData(conn, upstreamConn, outErr)
+		conn.Close()
+	}()
+
+	go func() {
+		tcpCopyData(upstreamConn, conn, outErr)
+		upstreamConn.Close()
+	}()
 
 	err = <-outErr
 	if err != nil {
